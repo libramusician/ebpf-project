@@ -4,6 +4,10 @@
 use aya_ebpf::{bindings::xdp_action, macros::xdp, programs::XdpContext};
 use aya_log_ebpf::info;
 use core::mem;
+use core::net::IpAddr;
+use aya_ebpf::macros::map;
+use aya_ebpf::maps::LpmTrie;
+use aya_ebpf::maps::lpm_trie::Key;
 
 use network_types::{
     eth::{EthHdr, EtherType},
@@ -13,6 +17,10 @@ use network_types::{
     // vxlan::VxlanHdr,
     // geneve::GeneveHdr
 };
+
+#[map]
+static FIREWALL_RULE_MAP: LpmTrie<u32, u32>
+= LpmTrie::with_max_entries(256, 0);
 
 #[inline(always)]
 unsafe fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
@@ -36,8 +44,8 @@ pub fn myapp(ctx: XdpContext) -> u32 {
 }
 
 fn try_myapp(ctx: XdpContext) -> Result<u32, ()> {
-    let ethhdr: *const EthHdr = unsafe { ptr_at(&ctx, 0)? };
-    match unsafe { *ethhdr }.ether_type() {
+    let eth_hdr: *const EthHdr = unsafe { ptr_at(&ctx, 0)? };
+    match unsafe { *eth_hdr }.ether_type() {
         Ok(EtherType::Ipv4) => {
 
             let ipv4hdr: *const Ipv4Hdr = unsafe { ptr_at(&ctx, EthHdr::LEN)? };
@@ -45,33 +53,43 @@ fn try_myapp(ctx: XdpContext) -> Result<u32, ()> {
             let dst_addr = unsafe { (*ipv4hdr).dst_addr() };
             let source_port = match unsafe { (*ipv4hdr).proto } {
                 IpProto::Tcp => {
-                    let tcphdr: *const TcpHdr =
+                    let tcp_hdr: *const TcpHdr =
                         unsafe { ptr_at(&ctx, EthHdr::LEN + Ipv4Hdr::LEN) }?;
-                    u16::from_be_bytes(unsafe { (*tcphdr).source })
+                    u16::from_be_bytes(unsafe { (*tcp_hdr).source })
                 }
                 IpProto::Udp => {
-                    let udphdr: *const UdpHdr =
+                    let udp_hdr: *const UdpHdr =
                         unsafe { ptr_at(&ctx, EthHdr::LEN + Ipv4Hdr::LEN) }?;
-                    unsafe { (*udphdr).src_port() }
+                    unsafe { (*udp_hdr).src_port() }
                 }
+                IpProto::Icmp => {0}
                 _ => return Ok(xdp_action::XDP_PASS),
             };
             let dst_port = match unsafe { (*ipv4hdr).proto } {
                 IpProto::Tcp => {
-                    let tcphdr: *const TcpHdr =
+                    let tcp_hdr: *const TcpHdr =
                         unsafe { ptr_at(&ctx, EthHdr::LEN + Ipv4Hdr::LEN) }?;
-                    u16::from_be_bytes(unsafe { (*tcphdr).dest })
+                    u16::from_be_bytes(unsafe { (*tcp_hdr).dest })
                 }
                 IpProto::Udp => {
-                    let udphdr: *const UdpHdr =
+                    let udp_hdr: *const UdpHdr =
                         unsafe { ptr_at(&ctx, EthHdr::LEN + Ipv4Hdr::LEN) }?;
-                    unsafe { (*udphdr).dst_port() }
+                    unsafe { (*udp_hdr).dst_port() }
                 }
+                IpProto::Icmp => {0}
                 _ => return Ok(xdp_action::XDP_PASS),
             };
 
             info!(&ctx, "SRC IP: {:i}, DST IP: {:i}, SRC PORT: {}, DST PORT: {}",
                 source_addr, dst_addr, source_port, dst_port);
+            let key = Key::new(32, source_addr.to_bits().to_be());
+
+
+            let action = match FIREWALL_RULE_MAP.get(&key){
+                Some(action) => *action,
+                None => {0}
+            };
+            info!(&ctx, "SRC action: {}", action);
         }
         _ => {},
     }
