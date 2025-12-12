@@ -63,14 +63,44 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to attach the XDP program with default flags - try changing XdpFlags::default() to XdpFlags::SKB_MODE")?;
 
     let mut rule_map:LpmTrie<_, u32,u32> = LpmTrie::try_from(ebpf.map_mut("FIREWALL_RULE_MAP").unwrap())?;
-    let ipaddr = Ipv4Addr::new(192, 168, 1, 0);
-    let key = Key::new(24, u32::from(ipaddr).to_be());
-    rule_map.insert(&key, 1, 0)?;
+    // let ipaddr = Ipv4Addr::new(192, 168, 1, 0);
+    // let key = Key::new(24, u32::from(ipaddr).to_be());
+    // rule_map.insert(&key, 1, 0)?;
 
-    let ctrl_c = signal::ctrl_c();
-    println!("Waiting for Ctrl-C...");
-    ctrl_c.await?;
-    println!("Exiting...");
+    let mut src_addr_text = "".to_owned();
+    let mut action_text = "".to_owned();
+    let mut src_addr_prefix_length = "".to_owned();
 
+
+
+    let options = eframe::NativeOptions::default();
+    eframe::run_simple_native("Packet Rule App", options, move |ctx, _frame| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("packet rules");
+            ui.horizontal(|ui| {
+                let src_addr_label = ui.label("source address");
+                ui.text_edit_singleline(&mut src_addr_text)
+                    .labelled_by(src_addr_label.id);
+                let src_addr_prefix_label = ui.label("prefix_length");
+                ui.text_edit_singleline(&mut src_addr_prefix_length)
+                    .labelled_by(src_addr_prefix_label.id);
+                let action_label = ui.label("action");
+                ui.text_edit_singleline(&mut action_text)
+                    .labelled_by(action_label.id);
+                let add_button = ui.button("add");
+                if add_button.clicked() {
+                    println!("{}, {}", &src_addr_text, &action_text);
+                    let src_addr = src_addr_text.parse::<Ipv4Addr>()
+                        .expect("invalid source address");
+                }
+            });
+        });
+    }).expect("TODO: panic message");
+
+    // let ctrl_c = signal::ctrl_c();
+    // println!("Waiting for Ctrl-C...");
+    // ctrl_c.await?;
+    // println!("Exiting...");
+    //
     Ok(())
 }
