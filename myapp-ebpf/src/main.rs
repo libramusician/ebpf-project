@@ -86,15 +86,17 @@ fn try_myapp(ctx: XdpContext) -> Result<u32, ()> {
 
 
             let action = match FIREWALL_RULE_MAP.get(&key){
+                // match and apply rule
                 Some(action) => *action,
-                None => {0}
+                // not match pass
+                None => {xdp_action::XDP_PASS}
             };
             info!(&ctx, "SRC action: {}", action);
+            Ok(action)
         }
-        _ => {},
+        // not IPV4
+        _ => Ok(xdp_action::XDP_PASS)
     }
-
-    Ok(xdp_action::XDP_PASS)
 }
 
 #[cfg(not(test))]
