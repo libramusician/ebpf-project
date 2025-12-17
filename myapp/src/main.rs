@@ -3,13 +3,16 @@ use aya::maps::lpm_trie::{LpmTrie, Key};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use axum::extract::State;
-use aya::maps::{MapData};
+use axum::http::StatusCode;
+use axum::Json;
+use aya::maps::{Array, MapData};
+use aya::Pod;
 use aya::programs::{Xdp, XdpFlags};
 use clap::Parser;
 use egui::mutex::Mutex;
 #[rustfmt::skip]
 use log::{debug, warn};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Parser)]
 struct Opt {
@@ -22,6 +25,23 @@ struct RuleReq {
     src: String,
     prefix_len: u32,
     action: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct IpPortMAC {
+    ip:  Ipv4Addr,
+    port: u16,
+    mac: [u8; 6],
+}
+
+unsafe impl Pod for IpPortMAC {}
+
+#[derive(Serialize)]
+struct RuleDto {
+    src: String,          // "192.168.1.0"
+    prefix_len: u32,      // 24
+    action: u32,          // 0/1
 }
 type RuleMap = LpmTrie<MapData, u32, u32>;
 
@@ -76,10 +96,19 @@ async fn main() -> anyhow::Result<()> {
 
     let rule_map:RuleMap = LpmTrie::try_from(ebpf.take_map("FIREWALL_RULE_MAP").unwrap())?;
 
+    let mut backends: Array<_, IpPortMAC> = Array::try_from(ebpf.take_map("BACKENDS").unwrap())?;
+    let backend1 = IpPortMAC{ip: Ipv4Addr::new(172,18,0,3), port: 80, mac: [0x42,0x83,0xd8,0x07,0x0c,0x23]};
+    let backend2 = IpPortMAC{ip: Ipv4Addr::new(172,18,0,4), port: 80, mac: [0x1a,0x74,0x61,0x49,0x78,0x7c]};
+    backends.set(0, &backend1, 0);
+    backends.set(1, &backend2, 0);
+
     let state = Arc::new(Mutex::new(rule_map));
 
     let app = axum::Router::new()
-        .route("/rules/drop/add", axum::routing::post(add_drop_rule)).with_state(state);
+        .route("/rules/drop/add", axum::routing::post(add_drop_rule))
+        .route("/rules/drop/list", axum::routing::get(list_drop_rule))
+        .route("/rules/drop/delete", axum::routing::delete(delete_drop_rule))
+        .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8000").await?;
     log::info!("HTTP server listening on 8000");
@@ -90,23 +119,68 @@ async fn main() -> anyhow::Result<()> {
 
 async fn add_drop_rule(State(state): State<Arc<Mutex<RuleMap>>
                        >,
-                       axum::Json(req): axum::Json<RuleReq>,)
-                       -> Result<axum::http::StatusCode, (axum::http::StatusCode, String)>
+                       Json(req): Json<RuleReq>,)
+                       -> Result<StatusCode, (StatusCode, String)>
 {
     let ip: Ipv4Addr = req
         .src
         .parse()
-        .map_err(|_| (axum::http::StatusCode::BAD_REQUEST, "bad src ip".to_string()))?;
+        .map_err(|_| (StatusCode::BAD_REQUEST, "bad src ip".to_string()))?;
 
     if req.prefix_len > 32 {
-        return Err((axum::http::StatusCode::BAD_REQUEST, "prefix_len > 32".to_string()));
+        return Err((StatusCode::BAD_REQUEST, "prefix_len > 32".to_string()));
     }
 
-    let key = Key::new(req.prefix_len as u32, u32::from(ip).to_be());
+    let key = Key::new(req.prefix_len, u32::from(ip).to_be());
     state.lock()
         .insert(&key, req.action, 0)
-        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("map insert: {}", e)))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("map insert: {}", e)))?;
 
     log::info!("rule added: {}/{} -> {}", req.src, req.prefix_len, req.action);
-    Ok(axum::http::StatusCode::CREATED)
+    Ok(StatusCode::CREATED)
+}
+
+async fn list_drop_rule(
+    State(state): State<Arc<Mutex<RuleMap>>>,
+) -> Result<(StatusCode, Json<Vec<RuleDto>>), (StatusCode, String)> {
+    let mut rules = Vec::new();
+    let map = state.lock();
+    for r in map.keys() {
+        match r {
+            Ok(key) => {
+                rules.push(RuleDto{
+                    src: Ipv4Addr::from(key.data().to_be()).to_string(),
+                    prefix_len: key.prefix_len(),
+                    action: map.get(&key, 0).unwrap()
+                })
+            }
+            Err(e) => {
+                eprintln!("failed to get key: {e}");
+            }
+        }
+    }
+    Ok((StatusCode::OK, Json(rules)))
+}
+
+async fn delete_drop_rule(State(state): State<Arc<Mutex<RuleMap>>
+>,
+                       Json(req): Json<RuleReq>,)
+                       -> Result<StatusCode, (StatusCode, String)>
+{
+    let ip: Ipv4Addr = req
+        .src
+        .parse()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "bad src ip".to_string()))?;
+
+    if req.prefix_len > 32 {
+        return Err((StatusCode::BAD_REQUEST, "prefix_len > 32".to_string()));
+    }
+
+    let key = Key::new(req.prefix_len, u32::from(ip).to_be());
+    state.lock()
+        .remove(&key)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("map insert: {}", e)))?;
+
+    log::info!("rule deleted: {}/{} -> {}", req.src, req.prefix_len, req.action);
+    Ok(StatusCode::OK)
 }

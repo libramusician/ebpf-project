@@ -1,0 +1,23 @@
+services:
+  nginx1:
+#    image: nginx:latest
+    image: mynginx:1
+    networks:
+      bridge:
+        ipv4_address: 172.18.0.3
+        mac_address: 42:83:d8:07:0c:23
+  nginx2:
+#    image: nginx:latest
+    image: mynginx:1
+    networks:
+      bridge:
+        ipv4_address: 172.18.0.4
+        mac_address: 1a:74:61:49:78:7c
+
+networks:
+  bridge:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.18.0.0/24
+          gateway: 172.18.0.1

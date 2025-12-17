@@ -4,12 +4,10 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
-myapp-common = { path = "../myapp-common" }
-
+myapp-common = { path = "../myapp-common"}
 aya-ebpf = { workspace = true }
 aya-log-ebpf = { workspace = true }
 network-types = "0.1.0"
-log = "0.4.28"
 
 [build-dependencies]
 which = { workspace = true }
