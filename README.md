@@ -1,4 +1,5 @@
 #### important
+cargo generate https://github.com/aya-rs/aya-template.git
 set RUST_LOG=info
 
 RUST_LOG=info cargo run  --config 'target."cfg(all())".runner="sudo -E"'

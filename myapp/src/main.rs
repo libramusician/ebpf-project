@@ -7,7 +7,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use aya::maps::{Array, MapData};
 use aya::Pod;
-use aya::programs::{Xdp, XdpFlags};
+use aya::programs::{tc, SchedClassifier, TcAttachType, Xdp, XdpFlags};
 use clap::Parser;
 use egui::mutex::Mutex;
 #[rustfmt::skip]
@@ -89,18 +89,23 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let Opt { iface } = opt;
-    let program: &mut Xdp = ebpf.program_mut("myapp").unwrap().try_into()?;
-    program.load()?;
-    program.attach(&iface, XdpFlags::default())
+    let xdp_program: &mut Xdp = ebpf.program_mut("my_xdp_app").unwrap().try_into()?;
+    xdp_program.load()?;
+    xdp_program.attach(&iface, XdpFlags::default())
         .context("failed to attach the XDP program with default flags - try changing XdpFlags::default() to XdpFlags::SKB_MODE")?;
+    let _ = tc::qdisc_add_clsact(&iface);
+    let ingress_program: &mut SchedClassifier = ebpf.program_mut("my_ingress_app").unwrap().try_into()?;
+    ingress_program.load()?;
+    ingress_program.attach(&iface, TcAttachType::Ingress)?;
 
     let rule_map:RuleMap = LpmTrie::try_from(ebpf.take_map("FIREWALL_RULE_MAP").unwrap())?;
 
     let mut backends: Array<_, IpPortMAC> = Array::try_from(ebpf.take_map("BACKENDS").unwrap())?;
-    let backend1 = IpPortMAC{ip: Ipv4Addr::new(172,18,0,3), port: 80, mac: [0x42,0x83,0xd8,0x07,0x0c,0x23]};
-    let backend2 = IpPortMAC{ip: Ipv4Addr::new(172,18,0,4), port: 80, mac: [0x1a,0x74,0x61,0x49,0x78,0x7c]};
-    backends.set(0, &backend1, 0);
-    backends.set(1, &backend2, 0);
+    let backend1 = IpPortMAC{ip: Ipv4Addr::new(192,168,3,101), port: 80, mac: [0x00,0x15,0x5d,0x01,0x6a,0x0c]};
+    // let backend2 = IpPortMAC{ip: Ipv4Addr::new(172,18,0,4), port: 80, mac: [0x1a,0x74,0x61,0x49,0x78,0x7c]};
+    // let backend1 = IpPortMAC{ip: Ipv4Addr::new(192,168,3,101), port: 80, mac: [0x00,0x15,0x5d,0x01,0x6a,0x04]};
+    backends.set(0, &backend1, 0)?;
+    // backends.set(1, &backend2, 0);
 
     let state = Arc::new(Mutex::new(rule_map));
 

@@ -767,7 +767,6 @@ version = "0.1.0"
 dependencies = [
  "aya-ebpf",
  "aya-log-ebpf",
- "myapp-common",
  "network-types",
  "which",
 ]
