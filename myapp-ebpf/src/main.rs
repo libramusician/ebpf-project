@@ -4,7 +4,6 @@ use aya_ebpf::{
     bindings::xdp_action, macros::xdp, programs::XdpContext,
 };
 use aya_log_ebpf::{error, info};
-use core::mem;
 use core::net::Ipv4Addr;
 use aya_ebpf::bindings::{BPF_F_PSEUDO_HDR, TC_ACT_OK};
 use aya_ebpf::helpers::bpf_redirect;
@@ -23,7 +22,6 @@ use network_types::{
 };
 use network_types::arp::ArpHdr;
 
-static VIP: Ipv4Addr =  Ipv4Addr::new(192, 168, 3, 100);
 static V_PORT: u16 = 80u16;
 
 #[repr(C)]
@@ -35,6 +33,9 @@ struct IpPort {
 
 #[map]
 static BACKEND_MAP: HashMap<IpPort, IpPortMAC> = HashMap::with_max_entries(60000, 0);
+
+#[map]
+static CONFIG_ARRAY: Array<u32> = Array::with_max_entries(20, 0);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -56,7 +57,7 @@ static FIREWALL_RULE_MAP: LpmTrie<u32, u32>
 unsafe fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*mut T, ()> {
     let start = ctx.data();
     let end = ctx.data_end();
-    let len = mem::size_of::<T>();
+    let len = size_of::<T>();
 
     if start + offset + len > end {
         return Err(());
@@ -148,7 +149,13 @@ fn try_my_ingress_app(mut ctx: TcContext) -> Result<i32, i32> {
     let src_addr = ipv4hdr.src_addr();
     let dst_addr = ipv4hdr.dst_addr();
     // only for VIP
-    if dst_addr != VIP{
+    let vip_bits = match CONFIG_ARRAY.get(2) {
+        None => {info!(&ctx, "no config array"); 0u32}
+        Some(r) => {*r}
+    };
+    let vip = Ipv4Addr::from(vip_bits);
+    info!(&ctx, "VIP IPv4 address: {}", vip);
+    if dst_addr != vip{
         return Ok(TC_ACT_OK);
     }
     // only deal with tcp
@@ -255,8 +262,14 @@ fn try_my_ingress_app(mut ctx: TcContext) -> Result<i32, i32> {
     let checksum = ipv4hdr.checksum();
 
     info!(&ctx, "new SRC IP: {}, DST IP: {}, checksum: {:x}", src_addr, dst_addr, checksum);
-    // Ok(unsafe { bpf_redirect(59, 0) as i32 })
-    Ok(TC_ACT_OK)
+    let iface_idx = match CONFIG_ARRAY.get(0) {
+        None => {
+            info!(&ctx, "iface idx not found");
+            0
+        }
+        Some(idx) => {*idx}
+    };
+    Ok(unsafe { bpf_redirect(iface_idx, 0) as i32 })
 }
 
 #[cfg(not(test))]

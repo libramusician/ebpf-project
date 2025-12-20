@@ -17,6 +17,8 @@ services:
 networks:
   bridge:
     driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: br-backend
     ipam:
       config:
         - subnet: 172.18.0.0/24

@@ -1,6 +1,7 @@
 use anyhow::Context as _;
 use aya::maps::lpm_trie::{LpmTrie, Key};
 use std::net::Ipv4Addr;
+use std::str::FromStr;
 use std::sync::Arc;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -12,12 +13,15 @@ use clap::Parser;
 use egui::mutex::Mutex;
 #[rustfmt::skip]
 use log::{debug, warn};
+use log::{error, info};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Parser)]
 struct Opt {
-    #[clap(short, long, default_value = "eth0")]
+    #[clap(short='i', long, default_value = "eth0")]
     iface: String,
+    #[clap(short='v', long)]
+    vip: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
             });
         }
     }
-    let Opt { iface } = opt;
+    let Opt { iface, vip } = opt;
     let xdp_program: &mut Xdp = ebpf.program_mut("my_xdp_app").unwrap().try_into()?;
     xdp_program.load()?;
     xdp_program.attach(&iface, XdpFlags::default())
@@ -98,14 +102,26 @@ async fn main() -> anyhow::Result<()> {
     ingress_program.load()?;
     ingress_program.attach(&iface, TcAttachType::Ingress)?;
 
+    let mut config_array: Array<_, u32>= Array::try_from(ebpf.take_map("CONFIG_ARRAY").unwrap())?;
+    // let idx = nix::net::if_::if_nametoindex("eth1").unwrap();
+    // config_array.set(0, idx, 0).expect("add iface idx failed");
+    let docker_br_idx = nix::net::if_::if_nametoindex("br-backend").expect("failed to get br-backend index");
+    match config_array.set(0, docker_br_idx, 0) {
+        Ok(_) => {info!("successfully set the docker_br_idx");}
+        Err(_) => {error!("failed to set the docker_br_idx");}
+    }
     let rule_map:RuleMap = LpmTrie::try_from(ebpf.take_map("FIREWALL_RULE_MAP").unwrap())?;
 
     let mut backends: Array<_, IpPortMAC> = Array::try_from(ebpf.take_map("BACKENDS").unwrap())?;
-    let backend1 = IpPortMAC{ip: Ipv4Addr::new(192,168,3,101), port: 80, mac: [0x00,0x15,0x5d,0x01,0x6a,0x0c]};
-    // let backend2 = IpPortMAC{ip: Ipv4Addr::new(172,18,0,4), port: 80, mac: [0x1a,0x74,0x61,0x49,0x78,0x7c]};
+    let backend1 = IpPortMAC{ip: Ipv4Addr::new(172,18,0,3), port: 80, mac: [0x42,0x83,0xd8,0x07,0x0c,0x23]}; //42:83:d8:07:0c:23
+    let backend2 = IpPortMAC{ip: Ipv4Addr::new(172,18,0,4), port: 80, mac: [0x1a,0x74,0x61,0x49,0x78,0x7c]}; //1a:74:61:49:78:7c
     // let backend1 = IpPortMAC{ip: Ipv4Addr::new(192,168,3,101), port: 80, mac: [0x00,0x15,0x5d,0x01,0x6a,0x04]};
     backends.set(0, &backend1, 0)?;
-    // backends.set(1, &backend2, 0);
+    backends.set(1, &backend2, 0)?;
+    // set there are 2 backends
+    config_array.set(1, 2, 0)?;
+    let vip = Ipv4Addr::from_str(vip.as_str())?.to_bits();
+    config_array.set(2, vip, 0)?;
 
     let state = Arc::new(Mutex::new(rule_map));
 
@@ -116,7 +132,7 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8000").await?;
-    log::info!("HTTP server listening on 8000");
+    info!("HTTP server listening on 8000");
     axum::serve(listener, app).await?;
 
     Ok(())
@@ -141,7 +157,7 @@ async fn add_drop_rule(State(state): State<Arc<Mutex<RuleMap>>
         .insert(&key, req.action, 0)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("map insert: {}", e)))?;
 
-    log::info!("rule added: {}/{} -> {}", req.src, req.prefix_len, req.action);
+    info!("rule added: {}/{} -> {}", req.src, req.prefix_len, req.action);
     Ok(StatusCode::CREATED)
 }
 
@@ -186,6 +202,6 @@ async fn delete_drop_rule(State(state): State<Arc<Mutex<RuleMap>>
         .remove(&key)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("map insert: {}", e)))?;
 
-    log::info!("rule deleted: {}/{} -> {}", req.src, req.prefix_len, req.action);
+    info!("rule deleted: {}/{} -> {}", req.src, req.prefix_len, req.action);
     Ok(StatusCode::OK)
 }

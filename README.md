@@ -8,3 +8,7 @@ net.ipv4.conf.all.arp_announce = 2
 net.ipv4.conf.all.arp_ignore = 1
 
 no panic
+config array:
+0: docker_br_idx
+1: number of backends
+2: VIP u32
