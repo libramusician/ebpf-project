@@ -6,7 +6,6 @@ use aya_ebpf::{
 use aya_log_ebpf::{error, info};
 use core::net::Ipv4Addr;
 use aya_ebpf::bindings::{BPF_F_PSEUDO_HDR, TC_ACT_OK};
-use aya_ebpf::cty::c_long;
 use aya_ebpf::helpers::bpf_redirect;
 use aya_ebpf::macros::{classifier, map};
 use aya_ebpf::maps::{LpmTrie, Array, HashMap};
@@ -48,7 +47,6 @@ struct IpPortMAC {
 #[map]
 static BACKENDS: Array<IpPortMAC>= Array::with_max_entries(1024, 0);
 
-static mut BACKEND_INDEX: u32 = 0;
 #[map]
 static FIREWALL_RULE_MAP: LpmTrie<u32, u32>
 = LpmTrie::with_max_entries(256, 0);
@@ -191,7 +189,7 @@ fn try_my_ingress_app(mut ctx: TcContext) -> Result<i32, i32> {
     let backend = match unsafe { BACKEND_MAP.get(&client_ip_port) } {
         None => {
             // new connection
-            match BACKENDS.get(unsafe { current_backend_idx }) {
+            match BACKENDS.get(current_backend_idx) {
                 None => {
                     // no backend, pass
                     info!(&ctx, "backend not found");

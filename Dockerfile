@@ -1,4 +1,7 @@
-FROM nginx:latest
-RUN apt update
-RUN apt install net-tools
-RUN apt install -y inetutils-ping
+FROM nginx:latest AS base
+
+FROM base AS server1
+RUN echo server1 > /usr/share/nginx/html/index.html
+
+FROM base AS server2
+RUN echo server2 > /usr/share/nginx/html/index.html
