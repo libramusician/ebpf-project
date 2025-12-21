@@ -6,6 +6,7 @@ use aya_ebpf::{
 use aya_log_ebpf::{error, info};
 use core::net::Ipv4Addr;
 use aya_ebpf::bindings::{BPF_F_PSEUDO_HDR, TC_ACT_OK};
+use aya_ebpf::cty::c_long;
 use aya_ebpf::helpers::bpf_redirect;
 use aya_ebpf::macros::{classifier, map};
 use aya_ebpf::maps::{LpmTrie, Array, HashMap};
@@ -48,7 +49,6 @@ struct IpPortMAC {
 static BACKENDS: Array<IpPortMAC>= Array::with_max_entries(1024, 0);
 
 static mut BACKEND_INDEX: u32 = 0;
-static mut BACKEND_NUMBER: u32 = 1;
 #[map]
 static FIREWALL_RULE_MAP: LpmTrie<u32, u32>
 = LpmTrie::with_max_entries(256, 0);
@@ -139,7 +139,7 @@ pub fn my_ingress_app(ctx: TcContext) -> i32 {
 }
 
 fn try_my_ingress_app(mut ctx: TcContext) -> Result<i32, i32> {
-    info!(&ctx, "enter TC");
+    info!(&ctx, "enter ingress TC");
     let eth_hdr = ctx.load::<EthHdr>(0).map_err(|_| TC_ACT_OK)?;
     // only support ipv4
     if eth_hdr.ether_type()? != EtherType::Ipv4 {
@@ -149,7 +149,7 @@ fn try_my_ingress_app(mut ctx: TcContext) -> Result<i32, i32> {
     let src_addr = ipv4hdr.src_addr();
     let dst_addr = ipv4hdr.dst_addr();
     // only for VIP
-    let vip_bits = match CONFIG_ARRAY.get(2) {
+    let vip_bits = match CONFIG_ARRAY.get(8) {
         None => {info!(&ctx, "no config array"); 0u32}
         Some(r) => {*r}
     };
@@ -177,11 +177,21 @@ fn try_my_ingress_app(mut ctx: TcContext) -> Result<i32, i32> {
         return Ok(TC_ACT_OK);
     }
 
+    let number_of_backend = match CONFIG_ARRAY.get(6) {
+        None => {1u32}
+        Some(num) => {*num}
+    };
+
+    let current_backend_idx = match CONFIG_ARRAY.get(19) {
+        None => {0}
+        Some(num) => {*num}
+    };
+
     let client_ip_port = IpPort{ip: src_addr, port: src_port};
     let backend = match unsafe { BACKEND_MAP.get(&client_ip_port) } {
         None => {
             // new connection
-            match BACKENDS.get(unsafe { BACKEND_INDEX }) {
+            match BACKENDS.get(unsafe { current_backend_idx }) {
                 None => {
                     // no backend, pass
                     info!(&ctx, "backend not found");
@@ -207,7 +217,18 @@ fn try_my_ingress_app(mut ctx: TcContext) -> Result<i32, i32> {
         }
     };
 
-    unsafe { BACKEND_INDEX = (BACKEND_INDEX + 1) % BACKEND_NUMBER; }
+    let mut next_backend_idx = current_backend_idx + 1;
+    if next_backend_idx >= number_of_backend {
+        next_backend_idx = 0;
+    }
+    match CONFIG_ARRAY.set(19, &next_backend_idx, 0) {
+        Ok(_) => {}
+        Err(_) => {
+            info!(&ctx, "updating backend index error");
+            return Ok(TC_ACT_OK);
+        }
+    };
+    // unsafe { BACKEND_INDEX = (BACKEND_INDEX + 1) % 2; }
 
     info!(&ctx, "DNAT {}:{} -> {}:{}, backendMAC {:x}:{:x}:{:x}:{:x}:{:x}:{:x}, checksum {:x}",
         dst_addr, dst_port,
@@ -262,14 +283,128 @@ fn try_my_ingress_app(mut ctx: TcContext) -> Result<i32, i32> {
     let checksum = ipv4hdr.checksum();
 
     info!(&ctx, "new SRC IP: {}, DST IP: {}, checksum: {:x}", src_addr, dst_addr, checksum);
-    let iface_idx = match CONFIG_ARRAY.get(0) {
+    let docker_iface_idx = match CONFIG_ARRAY.get(7) {
         None => {
             info!(&ctx, "iface idx not found");
             0
         }
         Some(idx) => {*idx}
     };
-    Ok(unsafe { bpf_redirect(iface_idx, 0) as i32 })
+    Ok(unsafe { bpf_redirect(docker_iface_idx, 0) as i32 })
+}
+
+#[classifier]
+pub fn my_egress_app(ctx: TcContext) -> i32 {
+    try_my_egress_app(ctx).unwrap_or_else(|ret| ret)
+}
+
+fn try_my_egress_app(mut ctx: TcContext) -> Result<i32, i32> {
+    info!(&ctx, "enter engress TC");
+    let eth_hdr = ctx.load::<EthHdr>(0).map_err(|_| TC_ACT_OK)?;
+    // only support ipv4
+    if eth_hdr.ether_type()? != EtherType::Ipv4 {
+        return Ok(TC_ACT_OK);
+    }
+    let ipv4hdr = ctx.load::<Ipv4Hdr>(EthHdr::LEN).map_err(|_| TC_ACT_OK)?;
+    let src_addr = ipv4hdr.src_addr();
+    let dst_addr = ipv4hdr.dst_addr();
+    // only for VIP
+    let vip_bits = match CONFIG_ARRAY.get(8) {
+        None => {info!(&ctx, "no config array"); 0u32}
+        Some(r) => {*r}
+    };
+    // only deal with tcp
+    let (src_port, dst_port) = match ipv4hdr.proto {
+        IpProto::Tcp => {
+            let tcp = ctx.load::<TcpHdr>(EthHdr::LEN + Ipv4Hdr::LEN).map_err(|_| TC_ACT_OK)?;
+            (u16::from_be_bytes(tcp.source), u16::from_be_bytes(tcp.dest))
+        }
+        _ => return Ok(TC_ACT_OK),
+    };
+
+    let lb_mac0 = *CONFIG_ARRAY.get(0).ok_or(TC_ACT_OK)? as u8;
+    let lb_mac1 = *CONFIG_ARRAY.get(1).ok_or(TC_ACT_OK)? as u8;
+    let lb_mac2 = *CONFIG_ARRAY.get(2).ok_or(TC_ACT_OK)? as u8;
+    let lb_mac3 = *CONFIG_ARRAY.get(3).ok_or(TC_ACT_OK)? as u8;
+    let lb_mac4 = *CONFIG_ARRAY.get(4).ok_or(TC_ACT_OK)? as u8;
+    let lb_mac5 = *CONFIG_ARRAY.get(5).ok_or(TC_ACT_OK)? as u8;
+    info!(&ctx, "SRC IP: {:i}, DST IP: {:i}, SRC PORT: {}, DST PORT: {}",
+        src_addr, dst_addr, src_port, dst_port
+    );
+
+    let client_ip_port = IpPort{ip: dst_addr, port: dst_port};
+
+    unsafe {
+        match BACKEND_MAP.get(&client_ip_port) {
+            None => {return Ok(TC_ACT_OK)}
+            // exist mapping, do SNAT
+            Some(_) => {
+                let vip = Ipv4Addr::from(vip_bits);
+                info!(&ctx, "SNAT {}->{} LB_MAC {:x}:{:x}:{:x}:{:x}:{:x}:{:x}",src_addr , vip,
+                    lb_mac0, lb_mac1, lb_mac2, lb_mac3, lb_mac4, lb_mac5
+                );
+                // SNAT IP
+                let old_be = u32::from_le_bytes(src_addr.octets());
+                let new_be = u32::from_le_bytes(vip.octets());
+                match ctx.skb.store(EthHdr::LEN + 12, &vip, 0) {
+                    Ok(_) => {
+                        info!(&ctx, "dest stored successful");
+                        match ctx.skb.l3_csum_replace(EthHdr::LEN + 10, old_be as u64, new_be as u64, 4) {
+                            Ok(_) => {
+                                info!(&ctx, "l3_csum_replace with {:x}->{:x}", old_be, new_be);
+                            }
+                            Err(e) => {
+                                info!(&ctx, "l3_csum_replace failed with code {}", e);
+                            }
+                        };
+                        match ctx.skb.l4_csum_replace(EthHdr::LEN + Ipv4Hdr::LEN + 16, old_be as u64, new_be as u64, 4 | BPF_F_PSEUDO_HDR as u64) {
+                            Ok(_) => {
+                                info!(&ctx, "l4_csum_replace with {:x}->{:x}", old_be, new_be);
+                            }
+                            Err(e) => {
+                                info!(&ctx, "l4_csum_replace failed with code {}", e);
+                            }
+                        };
+                    }
+                    Err(_) => {
+                        info!(&ctx, "dest stored failed");
+                    }
+                }
+                match ctx.skb.store(6, &[lb_mac0,lb_mac1,lb_mac2,lb_mac3,lb_mac4,lb_mac5], 0) {
+                    Ok(_) => {}
+                    Err(_) => {
+                        info!(&ctx, "mac stored failed");
+                    }
+                }
+
+            }
+        }
+    }
+    // read again
+    let eth_hdr = ctx.load::<EthHdr>(0).map_err(|_| TC_ACT_OK)?;
+    // only support ipv4
+    if eth_hdr.ether_type()? != EtherType::Ipv4 {
+        return Ok(TC_ACT_OK);
+    }
+    let ipv4hdr = ctx.load::<Ipv4Hdr>(EthHdr::LEN).map_err(|_| TC_ACT_OK)?;
+    let src_addr = ipv4hdr.src_addr();
+    let dst_addr = ipv4hdr.dst_addr();
+    let src_mac = eth_hdr.src_addr;
+    let dst_mac = eth_hdr.dst_addr;
+    // only deal with tcp
+    let (src_port, dst_port) = match ipv4hdr.proto {
+        IpProto::Tcp => {
+            let tcp = ctx.load::<TcpHdr>(EthHdr::LEN + Ipv4Hdr::LEN).map_err(|_| TC_ACT_OK)?;
+            (u16::from_be_bytes(tcp.source), u16::from_be_bytes(tcp.dest))
+        }
+        _ => return Ok(TC_ACT_OK),
+    };
+
+    info!(&ctx, "new SRC: {}:{} MAC: {:x}:{:x}:{:x}:{:x}:{:x}:{:x}, DST: {}:{} MAC: {:x}:{:x}:{:x}:{:x}:{:x}:{:x}",
+        src_addr, src_port, src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5],
+        dst_addr, dst_port, dst_mac[0], dst_mac[1], dst_mac[2], dst_mac[3], dst_mac[4], dst_mac[5]
+    );
+    Ok(TC_ACT_OK)
 }
 
 #[cfg(not(test))]

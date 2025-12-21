@@ -20,8 +20,6 @@ use serde::{Deserialize, Serialize};
 struct Opt {
     #[clap(short='i', long, default_value = "eth0")]
     iface: String,
-    #[clap(short='v', long)]
-    vip: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
             });
         }
     }
-    let Opt { iface, vip } = opt;
+    let Opt { iface} = opt;
     let xdp_program: &mut Xdp = ebpf.program_mut("my_xdp_app").unwrap().try_into()?;
     xdp_program.load()?;
     xdp_program.attach(&iface, XdpFlags::default())
@@ -102,14 +100,26 @@ async fn main() -> anyhow::Result<()> {
     ingress_program.load()?;
     ingress_program.attach(&iface, TcAttachType::Ingress)?;
 
+    let egress_program: &mut SchedClassifier = ebpf.program_mut("my_egress_app").unwrap().try_into()?;
+    egress_program.load()?;
+    egress_program.attach(&iface, TcAttachType::Egress)?;
+
     let mut config_array: Array<_, u32>= Array::try_from(ebpf.take_map("CONFIG_ARRAY").unwrap())?;
     // let idx = nix::net::if_::if_nametoindex("eth1").unwrap();
     // config_array.set(0, idx, 0).expect("add iface idx failed");
-    let docker_br_idx = nix::net::if_::if_nametoindex("br-backend").expect("failed to get br-backend index");
-    match config_array.set(0, docker_br_idx, 0) {
-        Ok(_) => {info!("successfully set the docker_br_idx");}
-        Err(_) => {error!("failed to set the docker_br_idx");}
-    }
+    let net_interfaces = pnet::datalink::interfaces();
+    let lb_if = net_interfaces.iter().find_map(|net_interface| {
+        if net_interface.name == iface{
+            Some(net_interface)
+        }else { None }
+    }).expect("LB interface not found");
+    let backend_br_if = net_interfaces.iter().find_map(|net_interface| {
+        if net_interface.name == "br-backend"{
+            Some(net_interface)
+        }else { None }
+    }).expect("Docker backend interface not found");
+
+
     let rule_map:RuleMap = LpmTrie::try_from(ebpf.take_map("FIREWALL_RULE_MAP").unwrap())?;
 
     let mut backends: Array<_, IpPortMAC> = Array::try_from(ebpf.take_map("BACKENDS").unwrap())?;
@@ -118,10 +128,28 @@ async fn main() -> anyhow::Result<()> {
     // let backend1 = IpPortMAC{ip: Ipv4Addr::new(192,168,3,101), port: 80, mac: [0x00,0x15,0x5d,0x01,0x6a,0x04]};
     backends.set(0, &backend1, 0)?;
     backends.set(1, &backend2, 0)?;
-    // set there are 2 backends
-    config_array.set(1, 2, 0)?;
-    let vip = Ipv4Addr::from_str(vip.as_str())?.to_bits();
-    config_array.set(2, vip, 0)?;
+
+    let lb_vip = lb_if.ips[0].ip().to_string();
+    let vip = Ipv4Addr::from_str(lb_vip.as_str())?.to_bits();
+
+    let lb_mac = lb_if.mac.unwrap();
+    config_array.set(0,lb_mac.0 as u32, 0)?;
+    config_array.set(1,lb_mac.1 as u32, 0)?;
+    config_array.set(2,lb_mac.2 as u32, 0)?;
+    config_array.set(3,lb_mac.3 as u32, 0)?;
+    config_array.set(4,lb_mac.4 as u32, 0)?;
+    config_array.set(5,lb_mac.5 as u32, 0)?;
+    // NUMBER_OF_BACKENDS
+    config_array.set(6, 2, 0)?;
+    // DOCKER_BR_INDEX
+    match config_array.set(7, backend_br_if.index, 0) {
+        Ok(_) => {info!("successfully set the docker_br_idx={}", backend_br_if.index);},
+        Err(_) => {error!("failed to set the docker_br_idx");}
+    }
+    config_array.set(8, vip, 0)?;
+    config_array.set(19,0, 0)?;
+
+
 
     let state = Arc::new(Mutex::new(rule_map));
 
@@ -132,7 +160,7 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8000").await?;
-    info!("HTTP server listening on 8000");
+    info!("HTTP server listening on {}:8000", lb_vip);
     axum::serve(listener, app).await?;
 
     Ok(())
